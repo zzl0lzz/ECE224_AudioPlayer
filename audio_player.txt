@@ -1,0 +1,577 @@
+/*=========================================================================*/
+/*  Includes                                                               */
+/*=========================================================================*/
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+
+#include <system.h>
+#include <sys/alt_alarm.h>
+#include <io.h>
+
+#include "fatfs.h"
+#include "diskio.h"
+
+#include "ff.h"
+#include "monitor.h"
+#include "uart.h"
+
+#include "sys/alt_irq.h"
+#include "alt_types.h"
+#include "altera_avalon_pio_regs.h"
+#include <altera_up_avalon_audio.h>
+#include <altera_up_avalon_audio_and_video_config.h>
+#include <altera_avalon_timer_regs.h>
+#include <altera_avalon_timer.h>
+
+/*=========================================================================*/
+/*  DEFINE: All Structures and Common Constants                            */
+/*=========================================================================*/
+
+/*=========================================================================*/
+/*  DEFINE: Macros                                                         */
+/*=========================================================================*/
+
+#define PSTR(_a)  _a
+
+// since the compiler we use doesnt support bool
+typedef int bool;
+enum { false, true };
+
+/*=========================================================================*/
+/*  DEFINE: Prototypes                                                     */
+/*=========================================================================*/
+
+/*=========================================================================*/
+/*  DEFINE: Definition of all local Data                                   */
+/*=========================================================================*/
+static alt_alarm alarm;
+static unsigned long Systick = 0;
+static volatile unsigned short Timer;   /* 1000Hz increment timer */
+int last_state = 5;
+int state = 5; // initial state is stop, which is stopped at the beginning
+// PLAY = 1;
+// PAUSE = 2;
+// NEXT = 3;
+// BACK = 4;
+// STOP = 5;
+
+
+
+/*=========================================================================*/
+/*  DEFINE: Definition of all local Procedures                             */
+/*=========================================================================*/
+
+/***************************************************************************/
+/*  TimerFunction                                                          */
+/*                                                                         */
+/*  This timer function will provide a 10ms timer and                      */
+/*  call ffs_DiskIOTimerproc.                                              */
+/*                                                                         */
+/*  In    : none                                                           */
+/*  Out   : none                                                           */
+/*  Return: none                                                           */
+/***************************************************************************/
+static alt_u32 TimerFunction (void *context)
+{
+   static unsigned short wTimer10ms = 0;
+
+   (void)context;
+
+   Systick++;
+   wTimer10ms++;
+   Timer++; /* Performance counter for this module */
+
+   if (wTimer10ms == 10)
+   {
+      wTimer10ms = 0;
+      ffs_DiskIOTimerproc();  /* Drive timer procedure of low level disk I/O module */
+   }
+
+   return(1);
+} /* TimerFunction */
+
+/***************************************************************************/
+/*  IoInit                                                                 */
+/*                                                                         */
+/*  Init the hardware like GPIO, UART, and more...                         */
+/*                                                                         */
+/*  In    : none                                                           */
+/*  Out   : none                                                           */
+/*  Return: none                                                           */
+/***************************************************************************/
+static void IoInit(void)
+{
+   uart0_init(115200);
+
+   /* Init diskio interface */
+   ffs_DiskIOInit();
+
+   //SetHighSpeed();
+
+   /* Init timer system */
+   alt_alarm_start(&alarm, 1, &TimerFunction, NULL);
+
+} /* IoInit */
+
+/*=========================================================================*/
+/*  DEFINE: All code exported                                              */
+/*=========================================================================*/
+
+uint32_t acc_size;                 /* Work register for fs command */
+uint16_t acc_files, acc_dirs;
+FILINFO Finfo;
+#if _USE_LFN
+char Lfname[512];
+#endif
+
+char Line[256];                 /* Console input buffer */
+
+FATFS Fatfs[_VOLUMES];          /* File system object for each logical drive */
+FIL File1, File2;               /* File objects */
+DIR Dir;                        /* Directory object */
+uint8_t Buff[8192] __attribute__ ((aligned(4)));  /* Working buffer */
+
+
+
+static
+FRESULT scan_files(char *path)
+{
+    DIR dirs;
+    FRESULT res;
+    uint8_t i;
+    char *fn;
+
+
+    if ((res = f_opendir(&dirs, path)) == FR_OK) {
+        i = (uint8_t)strlen(path);
+        while (((res = f_readdir(&dirs, &Finfo)) == FR_OK) && Finfo.fname[0]) {
+            if (0 && Finfo.fname[0] == '.')
+                continue;
+#if _USE_LFN
+            fn = *Finfo.lfname ? Finfo.lfname : Finfo.fname;
+#else
+            fn = Finfo.fname;
+#endif
+            if (Finfo.fattrib & AM_DIR) {
+                acc_dirs++;
+                *(path + i) = '/';
+                strcpy(path + i + 1, fn);
+                res = scan_files(path);
+                *(path + i) = '\0';
+                if (res != FR_OK)
+                    break;
+            } else {
+                //      xprintf("%s/%s\n", path, fn);
+                acc_files++;
+                acc_size += Finfo.fsize;
+            }
+        }
+    }
+
+    return res;
+}
+
+// function to check if an audio file has a .wav extension
+// returns 1 if file is .WAV, 0 otherwise
+int isWav(char *filename){
+	int len = strlen(filename);
+	return (filename[len-4] == '.' && filename[len-3] == 'W' && filename[len-2] == 'A' && filename[len-1] == 'V');
+}
+
+int song_index = 0;
+char Filename[20][20];
+int Fileindex[20];
+int Filesize[20];
+// function that controls what is displayed on the LCD display
+void LCDisplay(int index) {
+	FILE *lcd;
+	lcd = fopen("/dev/lcd_display", "w"); // open LCD stream
+
+	// make sure LCD file stream opened correctly
+	if (lcd != NULL) {
+		// clear the LCD screen
+		fprintf(lcd, "%c%s", 27, "[2J");
+		// print song info to LCD
+		fprintf(lcd, "%d. %s\n", Fileindex[index], Filename[index]);
+
+		if (state == 1) { // PLAYING state
+			switch (IORD(SWITH_PIO_BASE, 0)) {
+				case 0:
+					fprintf(lcd, "PLAYBACK-NORMAL SPD");
+					break;
+
+				case 1:
+					fprintf(lcd, "PLAYBACK-HALF SPD");
+					break;
+
+				case 2:
+					fprintf(lcd, "PLAYBACK-DBL SPD");
+					break;
+
+				case 3:
+					fprintf(lcd, "PLAYBACK-MONO-LEFT_Audio");
+					break;
+			}
+		} else { // NOT PLAYING state
+			switch (state) {
+				case 2:
+					fprintf(lcd, "PAUSED");
+					break;
+
+				case 5:
+					fprintf(lcd, "STOPPED");
+					break;
+			}
+		}
+	}
+	fclose(lcd);
+}
+
+/***************************************************************************/
+/*  ISRs                                                                   */
+/***************************************************************************/
+int WHPressbutton = 0; // state to see whether press or release the button
+int timecounter = 0;
+// ISR for the the timer
+static void TIMER_ISR(void* context, alt_u32 id) {
+	if (WHPressbutton == 0) { //press the button, the pio is not 15 means press, counter to 10
+		if (IORD(BUTTON_PIO_BASE,0) == 0xf) {
+			timecounter = 0;
+		} else {
+			timecounter++;
+		}
+
+		if (timecounter == 10) {
+			switch (IORD(BUTTON_PIO_BASE, 0)) { //we know which button we pressed
+				case 7: //button3 press, previous song
+					WHPressbutton = 4;
+					break;
+					
+				case 11: //button 2 press, stop song
+					WHPressbutton = 3;
+					break;
+
+				case 13: //button 1 press, play or pause song
+					WHPressbutton = 2;
+					break;
+
+				case 14: //button 0 press, next song
+					WHPressbutton = 1;
+					break;
+				}
+			timecounter = 0;
+		}
+
+	} else {
+		if (IORD(BUTTON_PIO_BASE,0) != 0xf) { //release the button, not pushed, counter to 10
+			timecounter = 0;
+		} else {
+			timecounter++;
+		}
+
+		// PLAY = 1;
+		// PAUSE = 2;
+		// NEXT = 3;
+		// BACK = 4;
+		// STOP = 5;
+
+		if (timecounter == 10) {
+			switch (WHPressbutton) { // use switch to change the state we need to change
+				case 1: // next song need to be played, button 0
+					if (state == 1) {
+						last_state = 1;
+					} else {
+						last_state = 5;
+					}
+					state = 3;
+					break;
+
+				case 2: // play or pause, button 1
+					if (state == 1) { // now is playing, we need to pause it
+						state = 2; // pause
+					} else { // paused or stopped, we need to play it now
+						state = 1;
+					}
+					break;
+
+				case 3: // stop song and reset, button 2
+					state = 5; // stop
+					break;
+
+				case 4: // previous song need to be played, button 3
+					if (state == 1) {
+						last_state = 1;
+					} else {
+						last_state = 5;
+					}
+					state = 4;
+					break;
+			}
+			timecounter = 0;
+			WHPressbutton = 0;
+
+		}
+	}
+	IOWR(SYSTEM_TIMER_BASE, 0, 0); // we set the timer control(offset 1) to 0, reset it
+	IOWR(BUTTON_PIO_BASE, 2, 0xf); //enable the pbinterrupt ISR for the next push, interruptmask offset 2
+	IOWR(BUTTON_PIO_BASE, 3, 0); // reset the interrupt
+}
+
+// ISR for the push button
+static void PB_ISR(void* context, alt_u32 id) {
+	IOWR(BUTTON_PIO_BASE, 2, 0);  //disable the button interrupt, we do not want push two buttons together
+
+	// set ITO, CONT and START to 1 which starts the timer
+	IOWR(SYSTEM_TIMER_BASE, 1, 0x7);
+
+	IOWR(BUTTON_PIO_BASE, 3 ,0); // reset the interrupt
+}
+
+
+/***************************************************************************/
+/*  main                                                                   */
+/***************************************************************************/
+int main(void)
+{
+	// register the ISR's
+	alt_irq_register( BUTTON_PIO_IRQ, (void*) 0, PB_ISR);
+	alt_irq_register( SYSTEM_TIMER_IRQ, (void*) 0, TIMER_ISR);
+
+	IOWR(SYSTEM_TIMER_BASE, 1, 0x1);  // writing a 1 will set ITO bit to generate IRQ when TO is 1 (done counting down)
+	IOWR(SYSTEM_TIMER_BASE, 0, 0); // writing 0 clears the timeout bit (internal counter != 0)
+	IOWR(SYSTEM_TIMER_BASE, 2, 0xC350); // 1ms/20ns = 50000 = 0xC350
+	IOWR(SYSTEM_TIMER_BASE, 3, 0x0); // higher bits, we don't need for small timer
+
+	// clear button interrupt line
+	IOWR(BUTTON_PIO_BASE, 2, 0xf);
+
+    long totalFileSize = 0;
+    uint8_t res = 0;
+
+	int x = 0; // play audio index
+	unsigned int l_buf;
+	unsigned int r_buf;
+	int readindex = 4; // normal and MONO and half use 4, double use 8
+	int switchmode = 0; // state flag to determine which mode to use
+
+	// these variables are used as parameters in f_read for the buffer
+	uint16_t BYTES_TO_READ = 1024;
+	uint16_t BYTE_READ;
+
+    alt_up_audio_dev * audio_dev;
+    // used for audio record/playback
+    // open the Audio port
+    audio_dev = alt_up_audio_open_dev ("/dev/Audio");
+    if ( audio_dev == NULL)
+    	alt_printf ("Error: could not open audio device \n");
+    else
+    	alt_printf ("Opened audio device \n");
+
+    IoInit();
+
+	// display 7 onto seven seg for some reason
+    IOWR(SEVEN_SEG_PIO_BASE,1,0x0007);
+
+	// initialization is good!
+    xputs(PSTR("FatFs module test monitor\n"));
+    xputs(_USE_LFN ? "LFN Enabled" : "LFN Disabled");
+    xprintf(", Code page: %u\n", _CODE_PAGE);
+
+
+	#if _USE_LFN
+		Finfo.lfname = Lfname;
+		Finfo.lfsize = sizeof(Lfname);
+	#endif
+
+    disk_initialize(0); //di 0
+
+    f_mount(0, &Fatfs[0]); //fi 0
+
+    // initialize song info arrays, store songname, file index and song index into arrays
+    res = f_opendir(&Dir, 0);
+    int file_counter = 1;
+
+	int i = 0; // this is to count through all the songs in the sd card (at the end it will be max # songs)
+
+    // go through all the files in the SD card
+	while(1) {
+		res = f_readdir(&Dir, &Finfo);
+		// make sure that opening the sd card and files are fine
+		// once we reach the end of the directory it will return null which we then exit
+		if ((res != FR_OK) || !Finfo.fname[0]) {
+			break;
+		}
+
+		// take the file info and put it into the specific arrays
+		if (isWav(&(Finfo.fname[0]))) {
+			strcpy(Filename[i], &Finfo.fname[0]);
+			Fileindex[i] = file_counter;
+			Filesize[i] = Finfo.fsize;
+			i++;
+		}
+		file_counter++;
+	}
+
+	totalFileSize = Filesize[song_index];
+
+	// initialize LCD display and show first audio file
+	LCDisplay(song_index);
+
+	int switchbutton = 0;
+	int totalNumOfSongs = i;  //we need to
+	int byte = 0;
+
+	// this is so that when we are in the while loop we only show the state once
+	// otherwise the screen keeps flashing due to constant updates
+	bool displayPauseOnce = false; // for Play/Pause
+	bool displayStoppedOnce = false; // for Stopped 
+
+	// TODO:
+	// 1. Attempting to switch songs while paused does not switch songs (can only switch while playing)
+	// 2. Switching songs does not stop the audio file
+	while (1) {
+		switch (state) { // state of audio player
+			case 1: // PLAY
+				displayStoppedOnce = false; // reset so we can display STOPPED again
+
+				// open the file to play
+				f_open(&File1, Filename[song_index], 1); //fo 1 xxx.WAV
+
+				switchbutton = IORD(SWITH_PIO_BASE, 0);
+				if ((switchbutton & 0x03) == 0x0) { // NORMAL mode
+					switchmode = 0;
+					readindex = 4;
+					byte = 512;
+
+				} else if ((switchbutton & 0x03) == 0x01) { // HALF mode
+					switchmode = 1;
+					readindex = 4;
+					byte = 16;
+
+				} else if ((switchbutton & 0x03) == 0x02) { // DOUBLE mode
+					switchmode = 2;
+					readindex = 8;
+					byte = 512;
+
+				} else if ((switchbutton & 0x03) == 0x03) { // MONO mode
+					switchmode = 3;
+					readindex = 4;
+					byte = 32;
+				}
+				
+				// update LCD to show PLAYING
+				LCDisplay(song_index);
+
+				// this is our "timer" to know at what point the audio is at
+				totalFileSize = Filesize[song_index];
+
+				// write into FIFO from buffer
+				while ((totalFileSize > 0) && (state == 1 || state == 2)) { // PLAY or PAUSE
+					if (state == 1) { // PLAY state
+					if ((uint32_t) totalFileSize >= byte) { // the bits what changes will improve the audio
+						BYTE_READ = byte;
+						totalFileSize -= BYTES_TO_READ;
+					} else {
+						BYTE_READ = totalFileSize;
+						totalFileSize = 0;
+					}
+
+						res = f_read(&File1, Buff, BYTES_TO_READ, &BYTE_READ); // take some data from sd card into buffer
+
+						// loop through the buffer in increments of 4 bytes
+						for (x = 0; x < BYTE_READ; x = x + readindex) {
+							// endian so we take the lower mem. for MSB
+							r_buf = ((Buff[x + 1] << 8)) | (Buff[x]);
+							l_buf = ((Buff[x + 3] << 8)) | (Buff[x + 2]);
+
+							// write to FIFO based on different modes
+							if (switchmode == 0 || switchmode == 2) { // NORMAL and DOUBLE speed
+								// always top up the FIFO's
+								while (alt_up_audio_write_fifo_space(audio_dev, ALT_UP_AUDIO_RIGHT) < 1 ||
+										alt_up_audio_write_fifo_space(audio_dev, ALT_UP_AUDIO_LEFT) < 1) {
+									// wait until FIFO is not full
+								}
+								alt_up_audio_write_fifo(audio_dev, &(r_buf), 1, ALT_UP_AUDIO_RIGHT);
+								alt_up_audio_write_fifo(audio_dev, &(l_buf), 1, ALT_UP_AUDIO_LEFT);
+
+							} else if (switchmode == 1) { // HALF speed
+								while (alt_up_audio_write_fifo_space(audio_dev, ALT_UP_AUDIO_RIGHT) < 1 ||
+										alt_up_audio_write_fifo_space(audio_dev, ALT_UP_AUDIO_LEFT) < 1) {
+									// wait until FIFO is not full
+								}
+								alt_up_audio_write_fifo(audio_dev, &(r_buf), 1, ALT_UP_AUDIO_RIGHT);
+								alt_up_audio_write_fifo(audio_dev, &(l_buf), 1,ALT_UP_AUDIO_LEFT);
+
+								// we play the same 16 bits again to simulate the sound being slower
+								while (alt_up_audio_write_fifo_space(audio_dev,	ALT_UP_AUDIO_RIGHT) < 1 ||
+										alt_up_audio_write_fifo_space(audio_dev, ALT_UP_AUDIO_LEFT) < 1) {
+									// wait until FIFO is not full
+								}
+								alt_up_audio_write_fifo(audio_dev, &(r_buf), 1, ALT_UP_AUDIO_RIGHT);
+								alt_up_audio_write_fifo(audio_dev, &(l_buf), 1, ALT_UP_AUDIO_LEFT);
+
+							} else if (switchmode == 3) { // MONO
+								while (alt_up_audio_write_fifo_space(audio_dev,	ALT_UP_AUDIO_RIGHT) < 1 ||
+										alt_up_audio_write_fifo_space(audio_dev, ALT_UP_AUDIO_LEFT) < 1) {
+									// wait until FIFO is not full
+								}
+								alt_up_audio_write_fifo(audio_dev, &(r_buf), 1, ALT_UP_AUDIO_LEFT);
+								alt_up_audio_write_fifo(audio_dev, &(r_buf), 1, ALT_UP_AUDIO_RIGHT);
+
+							}
+						}
+
+						// update to show PLAYING after it has been PAUSED
+						if (displayPauseOnce) {
+							LCDisplay(song_index);
+							displayPauseOnce = false;
+						}
+					} else if (!displayPauseOnce) { // update to show PAUSED after it has been PLAYED
+						LCDisplay(song_index);
+						displayPauseOnce = true;
+					}
+				}
+
+				// audio has finished play, then set state to STOPPED
+				if (state == 1 || state == 2) {
+					state = 5; // STOPPED state
+					LCDisplay(song_index);
+				}
+				break;
+
+			case 3: // NEXT
+				displayStoppedOnce = false; // reset so we can display STOPPED again
+				// we mod by total number of songs to prevent forward overflow  (e.g. 17+1 = 1)
+				song_index = (song_index + 1 ) % totalNumOfSongs;
+				state = last_state;
+				LCDisplay(song_index);
+				break;
+
+			case 4: // BACK
+				displayStoppedOnce = false; // reset so we can display STOPPED again
+				// we add total number of songs to control backwards overflow (e.g. 0-1 = 17)
+				song_index = (song_index - 1 + totalNumOfSongs) % totalNumOfSongs;
+				state = last_state;
+				LCDisplay(song_index);
+				break;
+
+			case 5: // STOP
+				f_close(&File1);
+				// update the display for STOPPED state only once so screen doesnt flash
+				if (!displayStoppedOnce) {
+					LCDisplay(song_index);
+					displayStoppedOnce = true;
+				}
+				break;
+		}
+	}
+	/*
+	 * This return here make no sense.
+	 * But to prevent the compiler warning:
+	 * "return type of 'main' is not 'int'
+	 * we use an int as return :-)
+	 */
+	return (0);
+}
